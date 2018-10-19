@@ -14,7 +14,7 @@ from nbconvert.preprocessors import CellExecutionError
 #import networkx
 
 
-class RdsFs():
+class RdsFs:
     '''
     Data Science "file system"
     The class  RdsFs handles syncing between memory and disk of python objects and pandas dataframes.
@@ -226,7 +226,7 @@ loaded objects:
            objects=objects)
 
 
-class RdsProject():
+class RdsProject:
     '''
     Ds Project incl. save/resume functionality.
     This class supports you in writing data science scripts.
@@ -300,10 +300,10 @@ class RdsProject():
 
         # resume from file if possible
         if self.resume(data):
-            logging.info('Project "%s" resumed with Rds version %s' % (self.project_name, __version__))
+            logging.info('Project "%s" resumed' % (self.project_name)
         else:
             self.start(data)
-            logging.info('Project "%s" created with Rds version %s' % (self.project_name, __version__))
+            logging.info('Project "%s" created' % self.project_name)
 
     def start(self, data=None):
         '''

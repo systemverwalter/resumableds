@@ -1,6 +1,4 @@
-name = 'resumableds'
+from .resumableds import RdsProject
+from .resumableds import RdsFs
 
-__all__ = [
-            'RdsFs',
-            'RdsProject',
-          ]
+__version__ = '0.1.0'
