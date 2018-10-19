@@ -300,7 +300,7 @@ class RdsProject:
 
         # resume from file if possible
         if self.resume(data):
-            logging.info('Project "%s" resumed' % (self.project_name)
+            logging.info('Project "%s" resumed' % self.project_name)
         else:
             self.start(data)
             logging.info('Project "%s" created' % self.project_name)
