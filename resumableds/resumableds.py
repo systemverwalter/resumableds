@@ -635,7 +635,7 @@ loaded dirs:\t{dirs}
            dirs=str(self.data_dirs),)
 
 
-    def run_subprocess(self, cmd_args, shell=False, check=False):
+    def run_subprocess(self, cmd_args, check=False):
         '''
         Helper function to make external command execution somewhat easier.
         '''
@@ -648,7 +648,7 @@ loaded dirs:\t{dirs}
         logging.debug('executing command: "%s"' % command)
         process = subprocess.run(
                                  cmd_args,
-                                 shell=shell,
+                                 shell=False,
                                  stdout=subprocess.PIPE,
                                  stderr=subprocess.PIPE,
                                  #capture_output=True,
