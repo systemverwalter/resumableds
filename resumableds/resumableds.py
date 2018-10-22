@@ -46,7 +46,7 @@ class RdsFs:
     proj2 = RdsFs('/mnt/data/project1') # create object from class
     proj2.disk2ram() # reads files back to python objects
     proj2.variable1 == 'foo' ==> True
-    type(proj2.df1) == pd.DataFrame ==> True
+    isinstance(proj2.df1, pd.DataFrame) ==> True
     '''
 
     def __init__(self, output_dir):
@@ -159,7 +159,7 @@ class RdsFs:
 
         # for all attributes in object...
         for name, obj in self.__dict__.items():
-            if type(obj) == pd.DataFrame:
+            if isinstance(obj, pd.DataFrame):
                 #if object is dataframe, dump it
                 self.dump(obj, name)
             else:
@@ -211,7 +211,7 @@ class RdsFs:
         '''
 
         files = '\n'.join(['\t%s: %s' % (str(k), str(v)) for k, v in self.ls().items()])
-        objects = '\n'.join(['\t%s: %s' % (str(k), str(v)) if not type(v) == pd.DataFrame else '\t%s: %s' % (str(k), str(v.shape)) for k, v in self.__dict__.items()])
+        objects = '\n'.join(['\t%s: %s' % (str(k), str(v)) if not instance(v, pd.DataFrame) else '\t%s: %s' % (str(k), str(v.shape)) for k, v in self.__dict__.items()])
 
         return '''
 {caption}
@@ -270,7 +270,7 @@ class RdsProject:
     Later on or in another python session, you can do this:
     proj2 = DsPtoject('project1') # create object from class (doesn't touch the dir as it already exists) All vars and data is read back to their original names.
     proj2.defs.variable1 == 'foo' ==> True
-    type(proj2.raw.df1) == pd.DataFrame ==> True
+    isinstance(proj2.raw.df1, pd.DataFrame) ==> True
     '''
 
     def __init__(self, project_name, data=None, **kwargs):
@@ -413,7 +413,7 @@ class RdsProject:
         if hasattr(self, self._defs):
             # analsysis timespan
             self.__dict__[self._defs].analysis_timespan = self.kwargs.get('analysis_timespan', '180 days')
-            if type(self.__dict__[self._defs].analysis_timespan) != pd.Timedelta:
+            if not isinstance(self.__dict__[self._defs].analysis_timespan, pd.Timedelta):
                 try:
                     self.__dict__[self._defs].analysis_timespan = pd.Timedelta(self.__dict__[self._defs].analysis_timespan)
                 except Exception as e:
@@ -492,14 +492,14 @@ class RdsProject:
         
         if data is None:
             # bootstrap
-            if len(self.data_dirs) == 0:
+            if self.data_dirs:
                 self.data_dirs = [self._external, self._raw, self._interim, self._processed, self._defs]
                 return self.data_dirs
             # if no update done, send current list
             return self.data_dirs
 
         # if single directory is given, make it a list for generic processing
-        if type(data) != list:
+        if isinstance(data, list):
             data = [data]
 
         # update data_dirs based on maybe newly added items
@@ -527,7 +527,6 @@ class RdsProject:
 
     def define_process_chain(self, specs):
         logging.error('not implemented')
-        pass
 
     def _run_process_chain_in_python(self, specs):
         '''
@@ -600,7 +599,7 @@ class RdsProject:
                                       '--ExecutePreprocessor.timeout=%d' % self.__dict__[self._defs].cell_execution_timeout, # this is required for long running cells like fetches
                                       '--execute',
                                       notebook],
-                                     shell=True,
+                                     shell=False,
                                      stdout=subprocess.PIPE,
                                      stderr=subprocess.PIPE)
 
@@ -636,7 +635,7 @@ loaded dirs:\t{dirs}
            dirs=str(self.data_dirs),)
 
 
-    def run_subprocess(self, cmd_args, shell=True, check=False):
+    def run_subprocess(self, cmd_args, shell=False, check=False):
         '''
         Helper function to make external command execution somewhat easier.
         '''
