@@ -63,7 +63,6 @@ class RdsFs:
         '''
         Creates the ouput directory to read/write files.
         '''
-
         logging.debug('create "%s" if not exists' % self.output_dir)
         try:
             os.makedirs(self.output_dir, exist_ok=True)
@@ -75,7 +74,7 @@ class RdsFs:
         Deletes the output directory including all its content and recreates an empty directory.
         '''
 
-        logging.debug('clean data directory "%s"' % self.output_dir)
+        logging.debug('clean output directory "%s"' % self.output_dir)
         try:
             shutil.rmtree(self.output_dir)
         except Exception as e:
@@ -211,7 +210,7 @@ class RdsFs:
         '''
 
         files = '\n'.join(['\t%s: %s' % (str(k), str(v)) for k, v in self.ls().items()])
-        objects = '\n'.join(['\t%s: %s' % (str(k), str(v)) if not instance(v, pd.DataFrame) else '\t%s: %s' % (str(k), str(v.shape)) for k, v in self.__dict__.items()])
+        objects = '\n'.join(['\t%s: %s' % (str(k), str(v)) if not isinstance(v, pd.DataFrame) else '\t%s: %s' % (str(k), str(v.shape)) for k, v in self.__dict__.items()])
 
         return '''
 {caption}
@@ -239,9 +238,9 @@ class RdsProject:
     output_dir: string, optional
         Path to the data directory; location of the data files on disk.
         Defaults to the current working directory.
-    data: list, optional
+    dirs: list, optional
         List of sub-directory names that should be used in the project.
-        Defaults to ['external', 'raw', 'defs', 'interim', 'processed']
+        Defaults to ['defs', 'external', 'raw', 'interim', 'processed']
     output_dir: string, optional
         Location of data files, defaults to ./<project_name>
     analysis_start_date: datetime (can also be string, will be converted automatically), optional
@@ -273,77 +272,84 @@ class RdsProject:
     isinstance(proj2.raw.df1, pd.DataFrame) ==> True
     '''
 
-    def __init__(self, project_name, data=None, **kwargs):
+    def __init__(self, project_name, dirs=None, **kwargs):
 
-        # set names of data directories
+        #
+        self.__always_load_defs = True
+
+        # set names of output directories
         # external: files from outside this project, external files will be copied here for further use
-        self._external = 'external'
+        self.EXTERNAL = 'external'
         # raw: raw info as got from e.g. a database or the odas fetch command
-        self._raw = 'raw'
+        self.RAW = 'raw'
         # half ready results / in-between steps
-        self._interim = 'interim'
+        self.INTERIM = 'interim'
         # analysis results
-        self._processed = 'processed'
+        self.PROCESSED = 'processed'
 
         # defs: save definitions like column names, etc
-        self._defs = 'defs'
+        self.DEFS = 'defs'
 
         # get a list of data dirs that should be used
-        self.data_dirs = []
-        self.data_dirs = self.__check_data(data)
+        self.output_dirs = []
+        self.output_dirs = self.__update_dir_specs(dirs)
 
         self.project_name = project_name
         self.kwargs = kwargs
 
         self.output_dir = self.kwargs.get('output_dir', os.path.join('.', self.project_name))
 
+        # define project's status file name
+        self.status_file = '%s.status' % self.project_name
+        self.status_file = os.path.join(self.output_dir, self.status_file)
 
         # resume from file if possible
-        if self.resume(data):
+        if self.resume(dirs):
             logging.info('Project "%s" resumed' % self.project_name)
         else:
-            self.start(data)
+            self.start(dirs)
             logging.info('Project "%s" created' % self.project_name)
 
-    def start(self, data=None):
+    def start(self, dirs=None):
         '''
         Initiate new project.
         No files will be touched!
 
         Parameters
         ----------
-        data: list, optional
+        dirs: list, optional
             List of sub-directory names that should be used in the project.
             By default all subdirectories defined in the contructor are taken into account.
         '''
 
-        data = self.__check_data(data)
+        dirs = self.__update_dir_specs(dirs)
 
-        for sub_dir in data:
+        for sub_dir in dirs:
             self.__dict__[sub_dir] = RdsFs(os.path.join(self.output_dir, sub_dir))
         # add some default definitions
         self.__kwargs2defs()
         self._status('started')
 
-    def save(self, data=None):
+    def save(self, dirs=None):
         '''
         Saves the state of ds project to disk.
 
         Parameters
         ----------
-        data: list, optional
+        dirs: list, optional
             List of sub-directoies that should be saved to disk.
             By default all subdirectories defined in the contructor are taken into account.
         '''
 
-        data = self.__check_data(data)
+        dirs = self.__update_dir_specs(dirs)
 
-        for sub_dir in data:
+        for sub_dir in dirs:
             self.__dict__[sub_dir].ram2disk()
-        saved_file = '%s.saved' % self.project_name
+        
         self._status('saved')
-        with open(saved_file, 'w') as f:
-            f.write('%s %s %s' % (datetime.datetime.now(), self.status, str(data)))
+        
+        with open(self.status_file, 'w') as f:
+            f.write('%s %s %s' % (datetime.datetime.now(), self.status, str(dirs)))
         logging.info('Project "%s" saved' % self.project_name)
 
     def fast_save(self):
@@ -352,13 +358,12 @@ class RdsProject:
         Handle with care. Data (in memory but on disk yet) can be lost.
         '''
 
-        saved_file = '%s.saved' % self.project_name
-        self._status('saved')
-        with open(saved_file, 'w') as f:
+        self._status('fast saved')
+        with open(self.status_file, 'w') as f:
             f.write('%s %s' % (datetime.datetime.now(), self._status))
         logging.info('Project "%s" saved' % self.project_name)
 
-    def resume(self, data=None, force=False):
+    def resume(self, dirs=None, force=False):
         '''
         Resumes
         Check if this project has been saved, if so, resume
@@ -366,39 +371,33 @@ class RdsProject:
 
         Parameters
         ----------
-        data: list, optional
+        dirs: list, optional
             List of sub-directoies that should be resumed.
             By default all subdirectories defined in the contructor are taken into account.
         force: boolean, optional
             switch to forcefully resume, even though the project state is not 'saved'.
             Defaults to False.
         '''
-        saved_file = '%s.saved' % self.project_name
-        if os.path.isfile(saved_file):
-            logging.info('saved project state found; resuming from last saved state') #TODO: read file to add save timestamp
-            self.__disk2ram(data)
-            os.unlink(saved_file)
-            #logging.info('analysis start date set to %s' % self.__dict__[self._defs].analysis_start_date)
-            #logging.info('analysis end date set to %s' % self.__dict__[self._defs].analysis_end_date)
-            #logging.info('analysis timespan set to %s' % self.__dict__[self._defs].analysis_timespan)
+
+        if os.path.isfile(self.status_file):
+            logging.info('saved project state found; resuming from last saved state')
+            self.__disk2ram(dirs)
+            os.unlink(self.status_file)
             self._status('resumed')
             return True
         elif force:
             logging.info('forcefully resuming from last saved state')
-            self.__disk2ram(data)
-            #logging.info('analysis start date set to %s' % self.__dict__[self._defs].analysis_start_date)
-            #logging.info('analysis end date set to %s' % self.__dict__[self._defs].analysis_end_date)
-            #logging.info('analysis timespan set to %s' % self.__dict__[self._defs].analysis_timespan)
+            self.__disk2ram(dirs)
             self._status('forcefully resumed')
             return True
 
         return False
 
-    def __disk2ram(self, data=None):
+    def __disk2ram(self, dirs=None):
 
-        data = self.__check_data(data)
+        dirs = self.__update_dir_specs(dirs)
 
-        for sub_dir in data:
+        for sub_dir in dirs:
             self.__dict__[sub_dir] = RdsFs(os.path.join(self.output_dir, sub_dir))
             self.__dict__[sub_dir].disk2ram()
 
@@ -410,65 +409,68 @@ class RdsProject:
             analysis_end_date:   today
         '''
 
-        if hasattr(self, self._defs):
+        if hasattr(self, self.DEFS):
             # analsysis timespan
-            self.__dict__[self._defs].analysis_timespan = self.kwargs.get('analysis_timespan', '180 days')
-            if not isinstance(self.__dict__[self._defs].analysis_timespan, pd.Timedelta):
+            self.__dict__[self.DEFS].analysis_timespan = self.kwargs.get('analysis_timespan', '180 days')
+            if not isinstance(self.__dict__[self.DEFS].analysis_timespan, pd.Timedelta):
                 try:
-                    self.__dict__[self._defs].analysis_timespan = pd.Timedelta(self.__dict__[self._defs].analysis_timespan)
+                    self.__dict__[self.DEFS].analysis_timespan = pd.Timedelta(self.__dict__[self.DEFS].analysis_timespan)
                 except Exception as e:
                     logging.error(e)
 
             # analysis start date
             # defaults to today - analysis timespan
-            self.__dict__[self._defs].analysis_start_date = self.kwargs.get('analysis_start_date',
-                                                                   pd.datetime.today() - self.__dict__[self._defs].analysis_timespan)
+            self.__dict__[self.DEFS].analysis_start_date = self.kwargs.get('analysis_start_date',
+                                                                   pd.datetime.today() - self.__dict__[self.DEFS].analysis_timespan)
 
-            logging.info('analysis start date set to %s' % self.__dict__[self._defs].analysis_start_date)
+            logging.info('analysis start date set to %s' % self.__dict__[self.DEFS].analysis_start_date)
 
             # analysis end date
             # defaults to today
-            self.__dict__[self._defs].analysis_end_date = self.kwargs.get('analysis_end_date', pd.datetime.today())
-            logging.info('analysis end date set to %s' % self.__dict__[self._defs].analysis_end_date)
+            self.__dict__[self.DEFS].analysis_end_date = self.kwargs.get('analysis_end_date', pd.datetime.today())
+            logging.info('analysis end date set to %s' % self.__dict__[self.DEFS].analysis_end_date)
 
             # re-calculate timespan as it might be wrong due to overwritten start or end date
-            self.__dict__[self._defs].analysis_timespan = self.__dict__[self._defs].analysis_end_date - self.__dict__[self._defs].analysis_start_date
-            logging.info('analysis timespan set to %s' % self.__dict__[self._defs].analysis_timespan)
+            self.__dict__[self.DEFS].analysis_timespan = self.__dict__[self.DEFS].analysis_end_date - self.__dict__[self.DEFS].analysis_start_date
+            logging.info('analysis timespan set to %s' % self.__dict__[self.DEFS].analysis_timespan)
 
-            # set the exec timeout of a single cell for process chain
-            self.__dict__[self._defs].cell_execution_timeout = self.kwargs.get('cell_execution_timeout', 3600)
+            # set the exec timeout of a single cell for notebooks execution
+            self.__dict__[self.DEFS].cell_execution_timeout = self.kwargs.get('cell_execution_timeout', 3600)
+
+            # set make_configs
+            self.__dict__[self.DEFS].make_configs = self.kwargs.get('make_configs', {})
 
 
-    def reset(self, data=None):
+    def reset(self, dirs=None):
         '''
         Reset the project state.
         This includes deleting all files from the output_dir.
 
         Parameters
         ----------
-        data: list, optional
+        dirs: list, optional
             List of sub-directoies that should be reset.
             By default all subdirectories defined in the contructor are taken into account.
         '''
-        self.kill(data)
-        self.start(data)
+        self.kill(dirs)
+        self.start(dirs)
 
-    def kill(self, data=None):
+    def kill(self, dirs=None):
         '''
         Delete all files in data dirs.
         
         Parameters
         ----------
-        data: list, optional
+        dirs: list, optional
             List of sub-directoies that should be reset.
             By default all subdirectories defined in the contructor are taken into account.
         '''
 
-        data = self.__check_data(data)
+        dirs = self.__update_dir_specs(dirs)
 
-        for sub_dir in data:
+        for sub_dir in dirs:
             self.__dict__[sub_dir].clean()
-        logging.info('data "%s" cleaned' % str(data))
+        logging.info('directories "%s" cleaned' % str(dirs))
         self._status('killed')
 
     def _status(self, status):
@@ -484,51 +486,85 @@ class RdsProject:
         self.status = status
         return self.status
 
-    def __check_data(self, data):
+    def __update_dir_specs(self, dirs):
         '''
-        Do a precheck for data dirs and return a list with specs.
-        TODO: refactor.
+        Do a precheck for output dirs and return a list with currently managed output dirs.
         '''
         
-        if data is None:
+        if dirs is None:
             # bootstrap
-            if self.data_dirs:
-                self.data_dirs = [self._external, self._raw, self._interim, self._processed, self._defs]
-                return self.data_dirs
-            # if no update done, send current list
-            return self.data_dirs
+            if not self.output_dirs:
+                dirs = sorted(
+                              [
+                                self.EXTERNAL,
+                                self.RAW,
+                                self.INTERIM,
+                                self.PROCESSED,
+                                self.DEFS,
+                              ]
+                             )
+            # if no dirs are added, return currenly managed list
+            else:
+                return self.output_dirs
 
         # if single directory is given, make it a list for generic processing
-        if isinstance(data, list):
-            data = [data]
+        if not isinstance(dirs, list):
+            dirs = [dirs]
+
+        if self.__always_load_defs:
+            dirs.append(self.DEFS)
 
         # update data_dirs based on maybe newly added items
-        self.data_dirs.extend(data)
-        self.data_dirs = list(set(self.data_dirs))
-        return data # only return new items for save / resume actions
+        self.output_dirs.extend(dirs)
+        self.output_dirs = list(set(self.output_dirs))
+        self.output_dirs = sorted(self.output_dirs)
+        return sorted(set(dirs)) # only return new items for save / resume actions
 
-    def run_process_chain(self, specs, subprocess=False):
+    def make_config(self, make_name, notebooks=None):
         '''
-        Run notebooks in defined working directories.
+        Get/Set 'make' process by name.
+        
         
         Parameters
         ----------
-        specs:  list
-            A list of notebooks to be executed in given order.
+        make_name: string
+            Name of the 'make' process.
+            Defaults to None which means the 
+        notebooks:  list
+            A list of notebooks that will be executed in given order when executing this process.
+            Defaults to None. Then the make config is returned but not updated.
+            If the process name doesn't exist, None is returned.
+        Returns the process chain (a list of notebooks) of the given make name.
+        '''
+        if notebooks:
+            self.__dict__[self.DEFS].make_configs[make_name] = notebooks
+            logging.debug('Make config "%s" registered as "%s"' % (str(notebooks), make_name))
+            return notebooks
+            
+        return self.__dict__[self.DEFS].make_configs.get(make_name, None)
+  
+    def make(self, make_name, subprocess=False):
+        '''
+        Run a make config that is previously defined by make_config().
+        
+        Parameters
+        ----------
+        make_name:  string
+            Name of the make config as defined by the method make_config().
         subprocess: boolean
             Defines if the notebook execution is done using subprocesses or not.
             Defaults to False.
         '''
+        
+        logging.info('run process chain "%s"' % make_name)
+        notebooks = self.__dict__[self.DEFS].make_configs[make_name]
 
         if subprocess:
-            logging.debug('run process chain as subprocesses')
-            return self._run_process_chain_as_subprocess(specs)
-        return self._run_process_chain_in_python(specs)
+            logging.debug('run notebooks as subprocesses')
+            return self._run_notebooks_as_subprocess(notebooks)
+        return self._run_notebooks_in_python(notebooks)          
 
-    def define_process_chain(self, specs):
-        logging.error('not implemented')
-
-    def _run_process_chain_in_python(self, specs):
+    def _run_notebooks_in_python(self, notebooks):
         '''
         Run list of notebooks (as python implementation)
         '''
@@ -536,7 +572,7 @@ class RdsProject:
         total_t0 = time()
         # save current working directory
         pwd = os.getcwd()
-        for k, abs_notebook_path in enumerate(specs):
+        for k, abs_notebook_path in enumerate(notebooks):
             notebook = os.path.basename(abs_notebook_path)
             w_dir = os.path.dirname(abs_notebook_path)
             executed_notebook = os.path.join(w_dir, '_'.join(('executed', notebook)))
@@ -553,7 +589,7 @@ class RdsProject:
                 nb = nbformat.read(f, as_version=4)
 
             # configure preprocessor with cell execution timeout
-            ep = ExecutePreprocessor(timeout=self.__dict__[self._defs].cell_execution_timeout)
+            ep = ExecutePreprocessor(timeout=self.__dict__[self.DEFS].cell_execution_timeout)
 
             try:
                 # execute notebook in working directory
@@ -575,7 +611,7 @@ class RdsProject:
         logging.info('all %d notebooks sucessfully executed in %d seconds' % (len(specs), (time()-total_t0)))
         return True
 
-    def _run_process_chain_as_subprocess(self, specs):
+    def _run_notebooks_as_subprocess(self, notebooks):
         '''
         Run list of notebooks (as subprocesses)
         '''
@@ -583,7 +619,7 @@ class RdsProject:
         total_t0 = time()
         # save current working directory
         pwd = os.getcwd()
-        for k, abs_notebook_path in enumerate(specs):
+        for k, abs_notebook_path in enumerate(notebooks):
             notebook = os.path.basename(abs_notebook_path)
             w_dir = os.path.dirname(abs_notebook_path)
             logging.info('Execute item %d / %d' % (k+1, len(specs)))
@@ -596,7 +632,7 @@ class RdsProject:
             # run from command line
             process = subprocess.run(['jupyter',
                                       'nbconvert',
-                                      '--ExecutePreprocessor.timeout=%d' % self.__dict__[self._defs].cell_execution_timeout, # this is required for long running cells like fetches
+                                      '--ExecutePreprocessor.timeout=%d' % self.__dict__[self.DEFS].cell_execution_timeout, # this is required for long running cells like fetches
                                       '--execute',
                                       notebook],
                                      shell=False,
@@ -625,14 +661,18 @@ class RdsProject:
         return '''
 {caption}
 {underline}
+Analysis time:\t{a_start} - {a_end} ({a_delta})
 State:\t\t{state}
-data dir:\t{data_dir}'
+output dir:\t{output_dir}'
 loaded dirs:\t{dirs}
 '''.format(caption=str(self),
            underline='=' * len(str(self)),
            state=self.status,
-           data_dir=self.output_dir,
-           dirs=str(self.data_dirs),)
+           a_start=str(self.__dict__[self.DEFS].analysis_start_date),
+           a_end=str(self.__dict__[self.DEFS].analysis_end_date),
+           a_delta=str(self.__dict__[self.DEFS].analysis_timespan),
+           output_dir=self.output_dir,
+           dirs=str(self.output_dirs),)
 
 
     def run_subprocess(self, cmd_args, check=False):
