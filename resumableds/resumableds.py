@@ -24,7 +24,9 @@ class RdsFs:
     The directory can be copied or moved on file system level to another location and later resumed in python.
     The file names on disk correspond with the object name in python.
     Python objects (as well as dataframes) must be created as attribute of the object of this class.
-    All attributes of this object will be synced between ram and disk when using ram2disk() or disk2ram().
+    All attributes of this object will be synced between ram and disk when using ram2disk() or disk2ram()
+    The class may not very useful on its own. It is used by class RdsProject.
+    Users acutally should use RdsProject.
 
     Parameters
     ----------
@@ -227,7 +229,7 @@ loaded objects:
 
 class RdsProject:
     '''
-    Ds Project incl. save/resume functionality.
+    RdsProject incl. save/resume functionality.
     This class supports you in writing data science scripts.
     Data can be saved and resumed avoiding unnessary retrievals of raw data from data storages.
 
@@ -254,10 +256,14 @@ class RdsProject:
     cell_execution_timeout: int, optional
         The execution timeout of a single cell in a process chain
         Defaults to 3600.
+    make_configs: dict, optional
+        'Make' configurations.
+        Example: {'raw': ['get_sql_data.ipynb', 'get_no_sql_data.ipynb']}
+        Defaults to {}.
 
     Example
     -------
-    proj1 = DsProject('project1') # create object from class (creates the dir if it doesn't exist yet)
+    proj1 = RdsProject('project1') # create object from class (creates the dir if it doesn't exist yet)
     proj1.raw.df1 = pd.DataFrame() # create dataframe as attribute of proj1.raw (RdsFs 'raw')
     proj1.defs.variable1 = 'foo' # create simple objects as attribute of proj1.defs (RdsFs 'defs')
     proj1.save() # saved attributes of all RfdFs in proj1 to disk
@@ -265,9 +271,13 @@ class RdsProject:
     This will result in the following directory structure (plus some overhead of internals):
     - <output_dir>/defs/var_variable1.pkl
     - <output_dir>/raw/df1.pkl
+    - <output_dir>/raw/df1.csv
+
+    Note, pandas dataframes are always dumped as pickle for further processing and as csv for easy exploration. The csv files are never read back anymore.
+
 
     Later on or in another python session, you can do this:
-    proj2 = DsPtoject('project1') # create object from class (doesn't touch the dir as it already exists) All vars and data is read back to their original names.
+    proj2 = RdsProject('project1') # create object from class (doesn't touch the dir as it already exists) All vars and data is read back to their original names.
     proj2.defs.variable1 == 'foo' ==> True
     isinstance(proj2.raw.df1, pd.DataFrame) ==> True
     '''
@@ -523,7 +533,6 @@ class RdsProject:
     def make_config(self, make_name, notebooks=None):
         '''
         Get/Set 'make' process by name.
-        
         
         Parameters
         ----------
