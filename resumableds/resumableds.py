@@ -58,12 +58,12 @@ class RdsFs:
 
         self.output_dir = output_dir
 
-        logging.debug('ouptut directory set to "%s"' % self.output_dir)
+        logging.debug('output directory set to "%s"' % self.output_dir)
         self.make_output_dir()
 
     def make_output_dir(self):
         '''
-        Creates the ouput directory to read/write files.
+        Creates the output directory to read/write files.
         '''
         logging.debug('create "%s" if not exists' % self.output_dir)
         try:
@@ -160,7 +160,7 @@ class RdsFs:
 
         # for all attributes in object...
         for name, obj in self.__dict__.items():
-            if isinstance(obj, pd.DataFrame):
+            if isinstance(obj, pd.DataFrame) or isinstance(obj, pd.Series):
                 #if object is dataframe, dump it
                 self.dump(obj, name)
             else:
@@ -258,7 +258,7 @@ class RdsProject:
         Defaults to 3600.
     make_configs: dict, optional
         'Make' configurations.
-        Example: {'raw': ['get_sql_data.ipynb', 'get_no_sql_data.ipynb']}
+        Example: {'raw': ['get_sql_data.ipynb', 'get_nosql_data.ipynb']}
         Defaults to {}.
 
     Example
@@ -313,8 +313,13 @@ class RdsProject:
         self.status_file = '%s.status' % self.project_name
         self.status_file = os.path.join(self.output_dir, self.status_file)
 
+        start_clean = self.kwargs.get('start_clean', False)
+
         # resume from file if possible
-        if self.resume(dirs):
+        if start_clean:
+            self.start(dirs)
+            logging.info('Project "%s" created' % self.project_name)
+        elif self.resume(dirs):
             logging.info('Project "%s" resumed' % self.project_name)
         else:
             self.start(dirs)
@@ -450,7 +455,6 @@ class RdsProject:
             # set make_configs
             self.__dict__[self.DEFS].make_configs = self.kwargs.get('make_configs', {})
 
-
     def reset(self, dirs=None):
         '''
         Reset the project state.
@@ -565,7 +569,7 @@ class RdsProject:
             Defaults to False.
         '''
         
-        logging.info('run process chain "%s"' % make_name)
+        logging.info('make "%s"' % make_name)
         notebooks = self.__dict__[self.DEFS].make_configs[make_name]
 
         if subprocess:
@@ -583,10 +587,12 @@ class RdsProject:
         pwd = os.getcwd()
         for k, abs_notebook_path in enumerate(notebooks):
             notebook = os.path.basename(abs_notebook_path)
+            
             w_dir = os.path.dirname(abs_notebook_path)
+
             executed_notebook = os.path.join(w_dir, '_'.join(('executed', notebook)))
 
-            logging.info('Execute item %d / %d' % (k+1, len(specs)))
+            logging.info('Execute item %d / %d' % (k+1, len(notebooks)))
             #logging.debug('change directory to "%s"' % w_dir)
             #os.chdir(w_dir)
             logging.info('running "%s"', abs_notebook_path)
@@ -617,7 +623,7 @@ class RdsProject:
                     except Exception as e:
                         logging.warning("Couldn't save notebook %s to disk. Continuing anyway." % executed_notebook)
 
-        logging.info('all %d notebooks sucessfully executed in %d seconds' % (len(specs), (time()-total_t0)))
+        logging.info('all %d notebooks sucessfully executed in %d seconds' % (len(notebooks), (time()-total_t0)))
         return True
 
     def _run_notebooks_as_subprocess(self, notebooks):
@@ -631,7 +637,7 @@ class RdsProject:
         for k, abs_notebook_path in enumerate(notebooks):
             notebook = os.path.basename(abs_notebook_path)
             w_dir = os.path.dirname(abs_notebook_path)
-            logging.info('Execute item %d / %d' % (k+1, len(specs)))
+            logging.info('Execute item %d / %d' % (k+1, len(notebooks)))
             logging.debug('change directory to "%s"' % w_dir)
             os.chdir(w_dir)
             logging.info('running "%s"', abs_notebook_path)
@@ -654,13 +660,13 @@ class RdsProject:
             logging.info('process execution took %d seconds' % (time()-t0))
 
             if process.returncode != 0:
-                logging.error('stopped process chain due to errors in subprocess at item %d / %d' % (k+1, len(specs)))
+                logging.error('stopped process chain due to errors in subprocess at item %d / %d' % (k+1, len(notebooks)))
                 os.chdir(pwd)
                 return False
 
         # change back to original working directory
         os.chdir(pwd)
-        logging.info('all %d notebooks sucessfully executed in %d seconds' % (len(specs), (time()-total_t0)))
+        logging.info('all %d notebooks sucessfully executed in %d seconds' % (len(notebooks), (time()-total_t0)))
         return True
 
     def __str__(self):
