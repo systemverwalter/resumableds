@@ -11,6 +11,7 @@ import platform
 import nbformat
 from nbconvert.preprocessors import ExecutePreprocessor
 from nbconvert.preprocessors import CellExecutionError
+import nbformat as nbf
 #import networkx
 
 
@@ -284,13 +285,14 @@ class RdsProject:
 
     def __init__(self, project_name, dirs=None, **kwargs):
 
-        #
+        # treat directory 'defs' as part of the project rather than a data source
         self.__always_load_defs = True
 
         # set names of output directories
-        # external: files from outside this project, external files will be copied here for further use
+        # external: files from outside this project,
+        # external files can be copied here for further use
         self.EXTERNAL = 'external'
-        # raw: raw info as got from e.g. a database or the odas fetch command
+        # raw: raw data retrieved from a data storage (like SQL server)
         self.RAW = 'raw'
         # half ready results / in-between steps
         self.INTERIM = 'interim'
@@ -722,3 +724,126 @@ loaded dirs:\t{dirs}
         logging.debug('process exited with returncode  %d' % process.returncode)
         logging.info('command "%s" executed in %d seconds' % (command, time()-t0))
         return True
+        
+    def create_notebook_templates(self):
+        '''
+        Create notebook templates in current working directory.
+        The notebooks contain a skeleton to support the resumableds workflow.
+        '''
+        
+        nb_defs = {
+                    '''\
+# Definitions
+
+Define project variables, etc.''': nbf.v4.new_markdown_cell,
+                    '''\
+import resumableds''': nbf.v4.new_code_cell,
+                    '''\
+# DS project name
+project = '%s'
+
+# create project
+rds = resumableds.RdsProject(project, 'defs')''' % self.project_name: nbf.v4.new_code_cell,
+                    '''\
+# your variables / definitions go here...
+
+#rds.defs.a = 'a variable'
+''': nbf.v4.new_code_cell,
+                    '''\
+# save defs to disk
+rds.save('defs')''': nbf.v4.new_code_cell,
+            '''\
+*(Notebook is based on resumableds template)*''': nbf.v4.new_markdown_cell,
+                }
+
+
+        nb_collection = {
+                    '''\
+# Data collection
+
+Get raw data from data storages.''': nbf.v4.new_markdown_cell,
+                    '''\
+import resumableds''': nbf.v4.new_code_cell,
+                    '''\
+# DS project name
+project = '%s'
+
+# create project
+rds = resumableds.RdsProject(project, 'raw')''' % self.project_name: nbf.v4.new_code_cell,
+                    '''\
+# your data retrieval here
+
+#rds.raw.customer_details = pd.read_sql_table('customer_details', example_con)
+''': nbf.v4.new_code_cell,
+                    '''\
+# save project
+rds.save('raw')''': nbf.v4.new_code_cell,
+                    '''\
+*(Notebook is based on resumableds template)*''': nbf.v4.new_markdown_cell,
+                        }
+
+        nb_processing = {
+                    '''\
+# Processing
+
+Manipulate your data.''': nbf.v4.new_markdown_cell,
+                    '''\
+import resumableds''': nbf.v4.new_code_cell,
+                    '''\
+# DS project name
+project = '%s'
+
+# create project
+rds = resumableds.RdsProject(project, ['raw', 'interim', 'processed'])''' % self.project_name: nbf.v4.new_code_cell,
+                    '''\
+# your data processing here
+
+#rds.interim.german_customers = rds.raw.customer_details.loc[rds.raw.customer_details['country'] == 'Germany']
+#rds.processed.customers_by_city = rds.interim.german_customers.groupby('city').customer_name.count()
+''': nbf.v4.new_code_cell,
+                    '''\
+# save project
+rds.save(['interim', 'processed'])''': nbf.v4.new_code_cell,
+                    '''\
+*(Notebook is based on resumableds template)*''': nbf.v4.new_markdown_cell,
+                        }
+
+        nb_graphs = {
+                    '''\
+# Graphical output
+
+Visualize your data.''': nbf.v4.new_markdown_cell,
+                    '''\
+import resumableds''': nbf.v4.new_code_cell,
+                    '''\
+# DS project name
+project = '%s'
+
+# create project
+rds = resumableds.RdsProject(project, ['processed'])''' % self.project_name: nbf.v4.new_code_cell,
+                    '''\
+# your data visualization here
+
+#rds.processed.customers_by_city.plot()
+''': nbf.v4.new_code_cell,
+                    '''\
+# save project
+rds.save('defs')''': nbf.v4.new_code_cell,
+                    '''\
+*(Notebook is based on resumableds template)*''': nbf.v4.new_markdown_cell,
+                  }
+
+
+        nb_templates = {
+                            '01_definitions.ipynb': nb_defs,
+                            '10_collection.ipynb': nb_collection,
+                            '20_processing.ipynb': nb_processing,
+                            '30_graphs.ipynb': nb_graphs,
+                            #'40_publication.ipynb': nb_publication,
+                       }
+
+        for nb_name, nb_cells in nb_templates.items():
+            logging.debug('create notebook "%s" from template' % nb_name)
+            nb = nbf.v4.new_notebook()
+            nb['cells'] = [f(arg) for arg, f in nb_cells.items()]
+            nbf.write(nb, nb_name)
