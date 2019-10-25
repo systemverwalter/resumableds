@@ -6,13 +6,70 @@ import glob
 import pandas as pd
 import datetime
 import pickle
+import yaml
 import subprocess
 import platform
 import nbformat
 from nbconvert.preprocessors import ExecutePreprocessor
 from nbconvert.preprocessors import CellExecutionError
-import nbformat as nbf
+from hashlib import md5
+from pandas.util import hash_pandas_object
+import multiprocessing as mp
 #import networkx
+
+class PandasObjectHasher:
+    '''
+    Class to compare two dataframes (or the same dataframe at different times).
+    This class will be used to determine if a loaded data object has changed
+    since the last load from disk.
+    '''
+    
+    def __init__(self, df):
+        self.data_hash_exception_occured = False
+        self.index_hash = self.__create_index_hash(df)
+        self.columns_hash = self.__create_columns_hash(df)
+        self.data_hash = self.__create_data_hash(df)
+    
+    def __create_index_hash(self, df):
+        return df.index.values.tolist()
+    
+    def __create_columns_hash(self, df):
+        if isinstance(df, pd.DataFrame):
+            return df.columns.values.tolist()
+        return None
+    
+    def __create_data_hash(self, df):
+        data_hash = None
+        try:
+            data_hash = md5(hash_pandas_object(df).values).hexdigest()
+        except Exception as e:
+            # hashing dataframes with mutable objects like lists inside will throw an exception
+            logging.debug(e) # debug because lib is also working without hashes
+            self.data_hash_exception_occured = True
+        return data_hash
+        
+    def index_changed(self, df):
+        return self.__create_index_hash(df) != self.index_hash
+    
+    def columns_changed(self, df):
+        return self.__create_columns_hash(df) != self.columns_hash
+    
+    def data_changed(self, df):
+        return self.__create_data_hash(df) != self.data_hash
+
+    def obj_changed(self, df):
+        
+        if self.data_hash_exception_occured:
+            #no data hash available, play safe -> presume data is changed
+            return True
+    
+        if self.index_changed(df):
+            return True
+        if self.columns_changed(df):
+            return True
+        if self.data_changed(df):
+            return True
+        return False
 
 
 class RdsFs:
@@ -26,6 +83,8 @@ class RdsFs:
     The file names on disk correspond with the object name in python.
     Python objects (as well as dataframes) must be created as attribute of the object of this class.
     All attributes of this object will be synced between ram and disk when using ram2disk() or disk2ram()
+    During loading from disk, the data objects are hashed for later comparison.
+    During dumping to disk, a check is done to only dump if there is a change compared to the disk version.
     The class may not very useful on its own. It is used by class RdsProject.
     Users acutally should use RdsProject.
 
@@ -52,12 +111,49 @@ class RdsFs:
     isinstance(proj2.df1, pd.DataFrame) ==> True
     '''
 
-    def __init__(self, output_dir):
+    def __init__(self, output_dir, nof_processes, backend):
 
         self.internal_obj_prefix = 'var_'
-        self.pickle_file_ext = '.pkl'
-
+        self.backend_file_extensions = {
+                                         'pickle': '.pkl',
+                                         'feather': '.feather',
+                                         'parquet': '.parquet',
+                                        }
+        self.pandas_dump_functions = {
+                                         'pickle': 'to_pickle',
+                                         'feather': 'to_feather',
+                                         'parquet': 'to_parquet',
+                                        }
+        
+        self.pandas_read_functions = {
+                                         'pickle': 'read_pickle',
+                                         'feather': 'read_feather',
+                                         'parquet': 'read_parquet',
+                                        }
+        
         self.output_dir = output_dir
+        self.nof_processes = nof_processes
+        self.backend = backend
+        
+        self.hash_objects = {}
+        
+        # max memory usage in GB allowed to do a csv dump
+        self.max_memory_for_csv_dump = 2
+        
+        # names of internal objects to be excluded from pickle dump
+        self.internals = (
+                            'internals',
+                            'internal_obj_prefix',
+                            'pickle_file_ext',
+                            'output_dir',
+                            'hash_objects',
+                            'max_memory_for_csv_dump',
+                            'nof_processes',
+                            'backend',
+                            'backend_file_extensions',
+                            'pandas_dump_functions',
+                            'pandas_read_functions',
+                          )
 
         logging.debug('output directory set to "%s"' % self.output_dir)
         self.make_output_dir()
@@ -66,7 +162,7 @@ class RdsFs:
         '''
         Creates the output directory to read/write files.
         '''
-        logging.debug('create "%s" if not exists' % self.output_dir)
+        #logging.debug('create "%s" if not exists' % self.output_dir)
         try:
             os.makedirs(self.output_dir, exist_ok=True)
         except FileExistsError as e:
@@ -88,26 +184,84 @@ class RdsFs:
         self.make_output_dir()
 
         return True
-
-    def load_dump(self, filename):
+        
+    def __load_pd_df(self, filename):
         '''
         Loads a pickle file into a dataframe.
-        The file name (w/o extension) will be used as python object name.
+        Returns a tuple of dataframe name (file name w/o extension), dataframe and dataframe hash
 
         Parameters
         ----------
         filename: string
             The absolute file name
         '''
-
+        
+        # find backend of a used file extension
+        reverse_backend_lookup = {v:k for k,v in self.backend_file_extensions.items()}
         dataframe_name = os.path.basename(filename).split('.')[0]
-        logging.debug('load dump "%s" into "%s"' % (filename, dataframe_name))
-        self.__dict__[dataframe_name] = pd.read_pickle(filename)
+        ext = os.path.basename(filename).split('.')[-1]
+        ext = '.' + ext #dict contains leading dot in name :/
+        use_backend = reverse_backend_lookup[ext]
+        read_func = self.pandas_read_functions[use_backend]
+        logging.debug('execute {} = pd.{}("{}")'.format(dataframe_name, read_func, filename))
+        dataframe = getattr(pd, read_func)(filename)
+        
+        # create data hash object and add it to dict of hash objects
+        logging.debug('create hash object to track changes')
+        dataframe_hash = PandasObjectHasher(dataframe)
+        
+        return (dataframe_name, dataframe, dataframe_hash)
 
-    def dump(self, dataframe, filename, sep=';', decimal=','):
+    def __dump_pd_df(self, dataframe, filename):
         '''
-        Dumps a dataframe to files:
-        - pickle file for further processing
+        Dumps a pandas dataframe / series to file.
+        File format depends on backend setting.
+
+        Parameters
+        ----------
+        dataframe: pd.DataFrame object
+            The dataframe that should be pickled
+        filename: string
+            The base name of the file w/o extension
+        '''
+        
+        # check if dump is required
+        dump_required = True
+        if filename in self.hash_objects.keys():
+            if self.hash_objects[filename].obj_changed(dataframe):
+                dump_required = True
+            else:
+                dump_required = False
+        else:
+            dump_required = True
+
+        if not dump_required:
+            logging.debug('no new dump required. Skip!')
+            return False
+        
+        # actual dump    
+        abs_fn = os.path.join(self.output_dir, filename)
+        # Series will always be pickled; dataframes only if backend is pickle
+        if isinstance(dataframe, pd.Series) or (self.backend == 'pickle'):
+            abs_fn_pickle = abs_fn + self.backend_file_extensions['pickle']
+            logging.debug('execute {}.to_pickle("{}")'.format(filename, abs_fn_pickle))
+            dataframe.to_pickle(abs_fn_pickle)
+        else:
+            abs_fn_w_ext = abs_fn + self.backend_file_extensions[self.backend]
+            dump_func_name = self.pandas_dump_functions[self.backend]
+            logging.debug('execute {}.{}("{}")'.format(filename, dump_func_name, abs_fn_w_ext))
+            getattr(dataframe, dump_func_name)(abs_fn_w_ext)
+        
+            
+        # create new data hash object and add it to dict of hash objects.
+        logging.debug('create hash object to track changes')
+        self.hash_objects[filename] = PandasObjectHasher(dataframe) # new hash or updated hash    
+        
+        return True
+                
+    def __dump_df_pd_csv(self, dataframe, filename, sep=';', decimal=','):
+        '''
+        Dumps a dataframe to csv:
         - csv file for easy exploration (this file will not be read anymore)
 
         Parameters
@@ -121,16 +275,23 @@ class RdsFs:
         decimal: string, optional
             The csv decimal separator, defaults to ','
         '''
+        
+        #df mem usage in GB
+        mem_usage = dataframe.memory_usage(index=True, deep=True)
+        # dataframes return series; series return int
+        if isinstance(mem_usage, pd.Series):
+            mem_usage = mem_usage.sum()
+        mem_usage = mem_usage / 1024 / 1024 / 1024
 
-        abs_fn = os.path.join(self.output_dir, filename)
-        abs_fn_pickle = abs_fn + self.pickle_file_ext
-        abs_fn_csv = abs_fn + '.csv'
-        logging.info('dump "%s"' % filename)
-        logging.debug('dump "%s"' % abs_fn_pickle)
-        dataframe.to_pickle(abs_fn_pickle)
-        logging.debug('dump "%s" with sep="%s" and decimal="%s"' % (abs_fn_csv, sep, decimal))
-        dataframe.to_csv(abs_fn_csv, sep=sep, decimal=decimal)
-
+        if mem_usage < self.max_memory_for_csv_dump:
+            abs_fn_csv = os.path.join(self.output_dir, filename) + '.csv'
+            logging.debug('dump "%s" with sep="%s" and decimal="%s"' % (abs_fn_csv, sep, decimal))
+            dataframe.to_csv(abs_fn_csv, sep=sep, decimal=decimal, header=True)
+            return True
+        else:
+            logging.debug('no dump to csv since dataframe memory usage is too large. Skip!')
+            return False
+        
     def _ls(self):
         '''
         Returns output directory content including mtime.
@@ -140,11 +301,11 @@ class RdsFs:
         Dict with file names as keys and mtime as values.
         '''
 
-        logging.debug('ls "%s"' % self.output_dir)
+        #logging.debug('ls "%s"' % self.output_dir)
         ls_content = glob.glob(os.path.join(self.output_dir, '*'))
         ls_content = {f:str(datetime.datetime.fromtimestamp(os.path.getmtime(f))) for f in ls_content}
-        for k, v in ls_content.items():
-            logging.debug('\t%s modified on %s' % (k, v))
+        #for k, v in ls_content.items():
+        #    logging.debug('\t%s modified on %s' % (k, v))
         return ls_content
 
     def ls(self):
@@ -154,46 +315,140 @@ class RdsFs:
         '''
         return {os.path.basename(k): v for k, v in self._ls().items() if not os.path.basename(k).startswith(self.internal_obj_prefix)}
 
-    def ram2disk(self):
+    def ram2disk(self, csv):
         '''
-        Saves all attributes of this object as files (pickles) to the output directory.
+        Saves all attributes of this object as files to the output directory.
         '''
+        t0 = time()
+        pool = mp.Pool(processes=self.nof_processes)
+        
+        # for all attributes in object (except internals)...
+        to_save = {k:v for k,v in self.__dict__.items() if k not in self.internals}
+        saved = []
+        for name, obj in to_save.items():
+            logging.debug('save %s...' % name)
+            pool.apply_async(
+                              self._ram2disk1obj,
+                              args=(obj, name, csv),
+                              callback=lambda x: saved.append(x),
+                            )
+        pool.close()
+        pool.join()
+        
+        if len(saved) == len(to_save.keys()):
+            logging.debug('sync to disk done for "%s": %d objects in %.2fs' % (
+                                                                                self.output_dir,
+                                                                                len(saved),
+                                                                                time() - t0
+                                                                               )
+                         )
+        else:
+            not_saved = [k for k in to_save.keys() if k not in saved]
+            logging.error('sync to disk failed for "%s": objects "%s" not saved' % (self.output_dir, not_saved))
+        
 
-        # for all attributes in object...
-        for name, obj in self.__dict__.items():
-            if isinstance(obj, pd.DataFrame) or isinstance(obj, pd.Series):
+    def _ram2disk1obj(self, obj, name, csv):
+        '''
+        Saves obj in file (name).
+        '''
+        
+        if isinstance(obj, pd.DataFrame) or isinstance(obj, pd.Series):
                 #if object is dataframe, dump it
-                self.dump(obj, name)
-            else:
-                # if not a dataframe, pickle it
-                base_name = self.internal_obj_prefix + name + self.pickle_file_ext
-                abs_fn = os.path.join(self.output_dir, base_name)
-                logging.debug('dump "%s"' % abs_fn)
-                with open(abs_fn, 'wb') as f:
-                    pickle.dump(obj, f)
-        logging.debug('sync to disk done for "%s"' % self.output_dir)
+                self.__dump_pd_df(obj, name)
+                if csv:
+                    self.__dump_df_pd_csv(obj, name)
+        #TODO: if isinstance(obj, dask)
+        #        #if object is dask dataframe, dump it
+        #        self.__dump_dask_df(obj, name, csv)
+        else:
+            # if not a dataframe, pickle it
+            base_name = self.internal_obj_prefix + name + self.backend_file_extensions['pickle']
+            abs_fn = os.path.join(self.output_dir, base_name)
+            logging.debug('dump "%s"' % abs_fn)
+            with open(abs_fn, 'wb') as f:
+                pickle.dump(obj, f)
+        return name # to collect saved items back in a list
 
     def disk2ram(self):
         '''
         Reads all pickle files from the output directory
         and loads them as attributes of this object.
         '''
+                
+        t0 = time()
+        pool = mp.Pool(processes=self.nof_processes)
+        
+        # get all data objects from dir
+        to_load = {k:v for k, v in self._ls().items() if (k.endswith(self.backend_file_extensions['pickle'])) or (k.endswith(self.backend_file_extensions[self.backend]))}
+        loaded = []
+        for fn, mtime in to_load.items():
+            logging.debug('load %s from %s...' % (fn, mtime))
+            pool.apply_async(
+                              self._disk2ram1obj,
+                              args=(fn,),
+                              callback=lambda x: loaded.append(x)
+                            )
+        pool.close()
+        pool.join()
+        
+        # from list to internal dict
+        for obj in loaded:
+            self.__load_in_class(obj)
+        
+        loaded_class_objects = [k for k in self.__dict__.keys() if k not in self.internals]
+        
+        if len(loaded_class_objects) == len(to_load.keys()):
+            logging.debug('sync to ram done for "%s": %d objects in %.2fs' % (
+                                                                                self.output_dir,
+                                                                             len(loaded_class_objects),
+                                                                                time() - t0
+                                                                               )
+                         )
+            return True
+        else:
+            not_loaded = [k for k in to_load.keys() if k not in loaded_class_objects]
+            logging.error('sync to ram failed for "%s": files "%s" not loaded' % (self.output_dir, not_loaded))
+            return False
 
-        files = self._ls()
-        for fn, mtime in files.items():
-            logging.debug('load %s from %s' % (fn, mtime))
-            base_name = os.path.basename(fn)
-            if  base_name.startswith(self.internal_obj_prefix):
-                # internal objects (no dataframes)
-                var_name = base_name[len(self.internal_obj_prefix):-1*len(self.pickle_file_ext)]
+    def _disk2ram1obj(self, fn):
+        '''
+        Reads a pickle file from the output directory
+        and loads it as attribute of this object.
+        '''
+        
+        var_name = None
+        var = None
+        var_hash = None
+        
+        base_name = os.path.basename(fn)
+        
+        if base_name.startswith(self.internal_obj_prefix):
+            # internal objects (no dataframes)
+            var_name = base_name[len(self.internal_obj_prefix):-1*len(self.backend_file_extensions['pickle'])]
+            try:
                 with open(fn, 'rb') as f:
-                    self.__dict__[var_name] = pickle.load(f)
-            else:
-                #if object is dataframe, load dump
-                if fn.endswith(self.pickle_file_ext):
-                    self.load_dump(fn)
-        logging.debug('sync to ram done for "%s"' % self.output_dir)
+                    var = pickle.load(f)
+            except Exception as e:
+                logging.error(e)
+                logging.error('skip "%s" from loading into memory due to an exception. Functionality might be broken!' % var_name)
+        else:
+            #if object is dataframe, load dump
+            if (fn.endswith(self.backend_file_extensions[self.backend])) or (fn.endswith(self.backend_file_extensions['pickle'])):
+                var_name, var, var_hash = self.__load_pd_df(fn)
+        
+        # hash is None for non-dataframes (so for regular Python objects)
+        return (var_name, var, var_hash)
 
+    def __load_in_class(self, var_info):
+        '''
+        load results of multiproccesing functions into class objects
+        '''
+        var_name, var, var_hash = var_info
+        if var_name:
+            self.__dict__[var_name] = var
+        if var_hash:
+            self.hash_objects[var_name] = var_hash
+    
     def __str__(self):
         '''
         Returns
@@ -213,7 +468,7 @@ class RdsFs:
         '''
 
         files = '\n'.join(['\t%s: %s' % (str(k), str(v)) for k, v in self.ls().items()])
-        objects = '\n'.join(['\t%s: %s' % (str(k), str(v)) if not isinstance(v, pd.DataFrame) else '\t%s: %s' % (str(k), str(v.shape)) for k, v in self.__dict__.items()])
+        objects = '\n'.join(['\t%s: %s' % (str(k), str(v)) if (not isinstance(v, pd.DataFrame)) and (not isinstance(v, pd.Series)) else '\t%s: %s' % (str(k), str(v.shape)) for k, v in {k:v for k,v in self.__dict__.items()if k not in self.internals}.items()])
 
         return '''
 {caption}
@@ -261,7 +516,13 @@ class RdsProject:
         'Make' configurations.
         Example: {'raw': ['get_sql_data.ipynb', 'get_nosql_data.ipynb']}
         Defaults to {}.
-
+    start_clean: boolean, optional
+        Skip resume if true.
+        Defaults to False.
+    nof_processes: int, optional
+        Configure the max number of parallel processes used to read/write data
+        Defaults to mp.cpu_count().
+        
     Example
     -------
     proj1 = RdsProject('project1') # create object from class (creates the dir if it doesn't exist yet)
@@ -283,11 +544,31 @@ class RdsProject:
     isinstance(proj2.raw.df1, pd.DataFrame) ==> True
     '''
 
-    def __init__(self, project_name, dirs=None, **kwargs):
+    def __init__(self, 
+                 project_name,
+                 dirs=None,
+                 output_dir=None,
+                 analysis_start_date=None,
+                 analysis_end_date=None,
+                 analysis_timespan='180 days',
+                 cell_execution_timeout=3600,
+                 make_configs={},
+                 start_clean=False,
+                 nof_processes=100,
+                 backend='pickle',
+                 ):
+        
+        # project name
+        self.project_name = project_name
 
-        # treat directory 'defs' as part of the project rather than a data source
-        self.__always_load_defs = True
-
+        # define project's status file name
+        self.status_file = '%s.yml' % self.project_name       
+        
+        # set number of processes (multiprocessing)
+        # this is done here and will be used in start / resume towards RdsFs
+        self.nof_processes = nof_processes if nof_processes <= mp.cpu_count() else mp.cpu_count() 
+        
+        
         # set names of output directories
         # external: files from outside this project,
         # external files can be copied here for further use
@@ -301,33 +582,60 @@ class RdsProject:
 
         # defs: save definitions like column names, etc
         self.DEFS = 'defs'
-
+        
         # get a list of data dirs that should be used
         self.output_dirs = []
         self.output_dirs = self.__update_dir_specs(dirs)
-
-        self.project_name = project_name
-        self.kwargs = kwargs
-
-        self.output_dir = self.kwargs.get('output_dir', os.path.join('.', self.project_name))
-
-        # define project's status file name
-        self.status_file = '%s.status' % self.project_name
-        self.status_file = os.path.join(self.output_dir, self.status_file)
-
-        start_clean = self.kwargs.get('start_clean', False)
-
-        # resume from file if possible
+        
+        
+        # start clean if desired
         if start_clean:
-            self.start(dirs)
-            logging.info('Project "%s" created' % self.project_name)
+            self.start(
+                        self.output_dirs,
+                        output_dir,
+                        analysis_start_date,
+                        analysis_end_date,
+                        analysis_timespan,
+                        cell_execution_timeout,
+                        make_configs,
+                        backend,
+                       )
+            self.clean()
+            self.save()
+        # resume if possible
         elif self.resume(dirs):
             logging.info('Project "%s" resumed' % self.project_name)
         else:
-            self.start(dirs)
-            logging.info('Project "%s" created' % self.project_name)
+            self.start(
+                        self.output_dirs,
+                        output_dir,
+                        analysis_start_date,
+                        analysis_end_date,
+                        analysis_timespan,
+                        cell_execution_timeout,
+                        make_configs,
+                        backend
+                       )
 
-    def start(self, dirs=None):
+        logging.debug('output_dir set to "%s"' % self.output_dir)
+        logging.debug('backend set to "%s"' % self.backend)
+        logging.debug('analysis_start_date set to "%s"' % self.analysis_start_date)
+        logging.debug('analysis_end_date set to "%s"' % self.analysis_end_date)
+        logging.debug('analysis_timespan set to "%s"' % self.analysis_timespan)
+        logging.debug('ready to rumble')
+
+            
+    def start(
+                self,
+                dirs,
+                output_dir,
+                analysis_start_date,
+                analysis_end_date,
+                analysis_timespan,
+                cell_execution_timeout,
+                make_configs,
+                backend,
+              ):
         '''
         Initiate new project.
         No files will be touched!
@@ -339,15 +647,61 @@ class RdsProject:
             By default all subdirectories defined in the contructor are taken into account.
         '''
 
-        dirs = self.__update_dir_specs(dirs)
+        # set ouput_dir
+        self.output_dir = output_dir
+        if self.output_dir is None:
+            self.output_dir = os.path.join('.', self.project_name)       
+        
+        # set backend binary format to read/write dataframes
+        self.backend = backend
+        
+        # analsysis timespan
+        self.analysis_timespan = analysis_timespan
+        if not isinstance(self.analysis_timespan, pd.Timedelta):
+            try:
+                self.analysis_timespan = pd.Timedelta(self.analysis_timespan)
+            except Exception as e:
+                logging.error(e)
+        
+        # analysis start date
+        self.analysis_start_date = analysis_start_date
+        if self.analysis_start_date is None:
+            self.analysis_start_date = pd.datetime.today() - self.analysis_timespan
+        
+        # analysis end date
+        # defaults to today
+        self.analysis_end_date = analysis_end_date
+        if self.analysis_end_date is None:
+            self.analysis_end_date = pd.datetime.today()
+        
+        # re-calculate timespan as it might be wrong due to overwritten start or end date
+        self.analysis_timespan = self.analysis_end_date - self.analysis_start_date
 
+        # set the exec timeout of a single cell for notebooks execution
+        self.cell_execution_timeout = cell_execution_timeout
+
+        # set make_configs
+        self.make_configs = make_configs
+        
+        # dict ot store successful execution dates
+        self.execution_dates_make_configs = {}
+        
+        # init working directories
         for sub_dir in dirs:
-            self.__dict__[sub_dir] = RdsFs(os.path.join(self.output_dir, sub_dir))
-        # add some default definitions
+            self.__dict__[sub_dir] = RdsFs(
+                                            os.path.join(self.output_dir, sub_dir), 
+                                            nof_processes=self.nof_processes,
+                                            backend=self.backend,
+                                          )
+        
+        # save project properties in defs
         self.__kwargs2defs()
+        
+        logging.info('Project "%s" created' % self.project_name)
         self._status('started')
+        self.save()
 
-    def save(self, dirs=None):
+    def save(self, dirs=None, csv=False):
         '''
         Saves the state of ds project to disk.
 
@@ -356,33 +710,30 @@ class RdsProject:
         dirs: list, optional
             List of sub-directoies that should be saved to disk.
             By default all subdirectories defined in the contructor are taken into account.
+        csv: boolean, optional
+            Save data files also as csv
+            Defaults to false
         '''
 
         dirs = self.__update_dir_specs(dirs)
 
         for sub_dir in dirs:
-            self.__dict__[sub_dir].ram2disk()
+            self.__dict__[sub_dir].ram2disk(csv)
         
+        # write status file
+        y_out = {
+                    'output_dir': self.output_dir,
+                    'backend': self.backend,
+                }
+        with open(self.status_file, 'w') as ymlfile:
+            ymlfile.write(yaml.dump(y_out))
+
         self._status('saved')
-        
-        with open(self.status_file, 'w') as f:
-            f.write('%s %s %s' % (datetime.datetime.now(), self.status, str(dirs)))
-        logging.info('Project "%s" saved' % self.project_name)
-
-    def fast_save(self):
-        '''
-        Only change status of project without acutally dumping any data (handy for debugging).
-        Handle with care. Data (in memory but on disk yet) can be lost.
-        '''
-
-        self._status('fast saved')
-        with open(self.status_file, 'w') as f:
-            f.write('%s %s' % (datetime.datetime.now(), self._status))
         logging.info('Project "%s" saved' % self.project_name)
 
     def resume(self, dirs=None, force=False):
         '''
-        Resumes
+        Resumes an existing project.
         Check if this project has been saved, if so, resume
         check for save can be skipped by forcing resume
 
@@ -398,16 +749,34 @@ class RdsProject:
 
         if os.path.isfile(self.status_file):
             logging.info('saved project state found; resuming from last saved state')
-            self.__disk2ram(dirs)
-            os.unlink(self.status_file)
-            self._status('resumed')
-            return True
+            
+            # read output_dir and backend from status file
+            # this eliminates the need to always provide an output_dir in the constructor
+            # backend is required to instantiate the RdsFs class correctly.
+            with open(self.status_file, 'r') as ymlfile:
+                cfg = yaml.load(ymlfile, Loader=yaml.BaseLoader)
+                self.output_dir = cfg['output_dir']
+                self.backend = cfg['backend'
+                                  ]
+            logging.debug('resuming from "%s"' % self.output_dir)
+            result = self.__disk2ram(dirs)
+            if result:
+                # read defs to project properties
+                self.__defs2kwargs()
+                self._status('resumed')
+                return True
+            else:
+                return False
         elif force:
             logging.info('forcefully resuming from last saved state')
-            self.__disk2ram(dirs)
-            self._status('forcefully resumed')
-            return True
-
+            result = self.__disk2ram(dirs)
+            if result:
+                # read defs to project properties
+                self.__defs2kwargs()
+                self._status('forcefully resumed')
+                return True
+            else:
+                return False
         return False
 
     def __disk2ram(self, dirs=None):
@@ -415,48 +784,53 @@ class RdsProject:
         dirs = self.__update_dir_specs(dirs)
 
         for sub_dir in dirs:
-            self.__dict__[sub_dir] = RdsFs(os.path.join(self.output_dir, sub_dir))
-            self.__dict__[sub_dir].disk2ram()
+            self.__dict__[sub_dir] = RdsFs(
+                                            os.path.join(self.output_dir, sub_dir),
+                                            nof_processes=self.nof_processes,
+                                            backend=self.backend,
+                                           )
+            result = self.__dict__[sub_dir].disk2ram()
+            if result:
+                continue
+            else:
+                return False
+        return True
 
     def __kwargs2defs(self):
         '''
-        Get some definitions from kwargs
-        Defaults to:
-            analysis_start_date: 180 days from now
-            analysis_end_date:   today
+        sync project properties to status file and defs container
         '''
+        # save in defs
+        self.__dict__[self.DEFS].project_output_dir = self.output_dir
+        self.__dict__[self.DEFS].analysis_start_date = self.analysis_start_date
+        self.__dict__[self.DEFS].analysis_end_date = self.analysis_end_date
+        self.__dict__[self.DEFS].analysis_timespan = self.analysis_timespan
+        self.__dict__[self.DEFS].cell_execution_timeout = self.cell_execution_timeout
+        self.__dict__[self.DEFS].make_configs = self.make_configs
+        self.__dict__[self.DEFS].execution_dates_make_configs = self.execution_dates_make_configs
+        self.__dict__[self.DEFS].nof_processes = self.nof_processes
+        self.__dict__[self.DEFS].backend = self.backend
 
-        if hasattr(self, self.DEFS):
-            # analsysis timespan
-            self.__dict__[self.DEFS].analysis_timespan = self.kwargs.get('analysis_timespan', '180 days')
-            if not isinstance(self.__dict__[self.DEFS].analysis_timespan, pd.Timedelta):
-                try:
-                    self.__dict__[self.DEFS].analysis_timespan = pd.Timedelta(self.__dict__[self.DEFS].analysis_timespan)
-                except Exception as e:
-                    logging.error(e)
-
-            # analysis start date
-            # defaults to today - analysis timespan
-            self.__dict__[self.DEFS].analysis_start_date = self.kwargs.get('analysis_start_date',
-                                                                   pd.datetime.today() - self.__dict__[self.DEFS].analysis_timespan)
-
-            logging.info('analysis start date set to %s' % self.__dict__[self.DEFS].analysis_start_date)
-
-            # analysis end date
-            # defaults to today
-            self.__dict__[self.DEFS].analysis_end_date = self.kwargs.get('analysis_end_date', pd.datetime.today())
-            logging.info('analysis end date set to %s' % self.__dict__[self.DEFS].analysis_end_date)
-
-            # re-calculate timespan as it might be wrong due to overwritten start or end date
-            self.__dict__[self.DEFS].analysis_timespan = self.__dict__[self.DEFS].analysis_end_date - self.__dict__[self.DEFS].analysis_start_date
-            logging.info('analysis timespan set to %s' % self.__dict__[self.DEFS].analysis_timespan)
-
-            # set the exec timeout of a single cell for notebooks execution
-            self.__dict__[self.DEFS].cell_execution_timeout = self.kwargs.get('cell_execution_timeout', 3600)
-
-            # set make_configs
-            self.__dict__[self.DEFS].make_configs = self.kwargs.get('make_configs', {})
-
+    def __defs2kwargs(self):
+        '''
+        sync project properties to status file and defs container
+        '''
+        # load from defs
+        self.output_dir = self.__dict__[self.DEFS].project_output_dir
+        self.analysis_start_date = self.__dict__[self.DEFS].analysis_start_date
+        self.analysis_end_date = self.__dict__[self.DEFS].analysis_end_date
+        self.analysis_timespan = self.__dict__[self.DEFS].analysis_timespan
+        self.cell_execution_timeout = self.__dict__[self.DEFS].cell_execution_timeout
+        self.make_configs = self.__dict__[self.DEFS].make_configs
+        try:
+            self.execution_dates_make_configs = self.__dict__[self.DEFS].execution_dates_make_configs
+        except AttributeError:
+            logging.debug('create empty dict "execution_dates_make_configs"')
+            self.__dict__[self.DEFS].execution_dates_make_configs = {}
+            self.execution_dates_make_configs = self.__dict__[self.DEFS].execution_dates_make_configs
+        self.nof_processes = self.__dict__[self.DEFS].nof_processes
+        self.backend = self.__dict__[self.DEFS].backend
+        
     def reset(self, dirs=None):
         '''
         Reset the project state.
@@ -468,10 +842,10 @@ class RdsProject:
             List of sub-directoies that should be reset.
             By default all subdirectories defined in the contructor are taken into account.
         '''
-        self.kill(dirs)
-        self.start(dirs)
+        self.clean(dirs)
+        self.save(dirs)
 
-    def kill(self, dirs=None):
+    def clean(self, dirs=None):
         '''
         Delete all files in data dirs.
         
@@ -487,11 +861,14 @@ class RdsProject:
         for sub_dir in dirs:
             self.__dict__[sub_dir].clean()
         logging.info('directories "%s" cleaned' % str(dirs))
-        self._status('killed')
+        # push back the project props to defs
+        self.__kwargs2defs()
+        self._status('cleaned')
 
     def _status(self, status):
         '''
         Change the internal status of project.
+        The internal attributes will be synced to defs and to the status file as well.
         
         Parameters
         ----------
@@ -500,6 +877,7 @@ class RdsProject:
         '''
         logging.debug('"%s" status changed to "%s"' % (self.project_name, status))
         self.status = status
+        
         return self.status
 
     def __update_dir_specs(self, dirs):
@@ -527,8 +905,8 @@ class RdsProject:
         if not isinstance(dirs, list):
             dirs = [dirs]
 
-        if self.__always_load_defs:
-            dirs.append(self.DEFS)
+        # always add defs
+        dirs.append(self.DEFS)
 
         # update data_dirs based on maybe newly added items
         self.output_dirs.extend(dirs)
@@ -552,12 +930,14 @@ class RdsProject:
         Returns the process chain (a list of notebooks) of the given make name.
         '''
         if notebooks:
-            self.__dict__[self.DEFS].make_configs[make_name] = notebooks
+            self.make_configs[make_name] = notebooks
+            # sync to defs
+            self.__kwargs2defs()
             logging.debug('Make config "%s" registered as "%s"' % (str(notebooks), make_name))
             return notebooks
             
-        return self.__dict__[self.DEFS].make_configs.get(make_name, None)
-  
+        return self.make_configs.get(make_name, None)
+    
     def make(self, make_name, subprocess=False):
         '''
         Run a make config that is previously defined by make_config().
@@ -572,12 +952,19 @@ class RdsProject:
         '''
         
         logging.info('make "%s"' % make_name)
-        notebooks = self.__dict__[self.DEFS].make_configs[make_name]
+        notebooks = self.make_configs[make_name]
 
         if subprocess:
             logging.debug('run notebooks as subprocesses')
-            return self._run_notebooks_as_subprocess(notebooks)
-        return self._run_notebooks_in_python(notebooks)          
+            result = self._run_notebooks_as_subprocess(notebooks)
+        else:
+            result = self._run_notebooks_in_python(notebooks)
+        
+        if result:
+            # save execution date of successful run of a make_config
+            self.execution_dates_make_configs[make_name] = datetime.datetime.now()
+        
+        return result
 
     def _run_notebooks_in_python(self, notebooks):
         '''
@@ -592,7 +979,8 @@ class RdsProject:
             
             w_dir = os.path.dirname(abs_notebook_path)
 
-            executed_notebook = os.path.join(w_dir, '_'.join(('executed', notebook)))
+            #executed_notebook = os.path.join(w_dir, '_'.join(('executed', notebook)))
+            executed_notebook = os.path.join(pwd, '_'.join(('executed', notebook)))
 
             logging.info('Execute item %d / %d' % (k+1, len(notebooks)))
             #logging.debug('change directory to "%s"' % w_dir)
@@ -606,7 +994,7 @@ class RdsProject:
                 nb = nbformat.read(f, as_version=4)
 
             # configure preprocessor with cell execution timeout
-            ep = ExecutePreprocessor(timeout=self.__dict__[self.DEFS].cell_execution_timeout)
+            ep = ExecutePreprocessor(timeout=self.cell_execution_timeout)
 
             try:
                 # execute notebook in working directory
@@ -680,14 +1068,14 @@ class RdsProject:
 {underline}
 Analysis time:\t{a_start} - {a_end} ({a_delta})
 State:\t\t{state}
-output dir:\t{output_dir}'
+output dir:\t{output_dir}
 loaded dirs:\t{dirs}
 '''.format(caption=str(self),
            underline='=' * len(str(self)),
            state=self.status,
-           a_start=str(self.__dict__[self.DEFS].analysis_start_date),
-           a_end=str(self.__dict__[self.DEFS].analysis_end_date),
-           a_delta=str(self.__dict__[self.DEFS].analysis_timespan),
+           a_start=str(self.analysis_start_date),
+           a_end=str(self.analysis_end_date),
+           a_delta=str(self.analysis_timespan),
            output_dir=self.output_dir,
            dirs=str(self.output_dirs),)
 
@@ -735,25 +1123,25 @@ loaded dirs:\t{dirs}
                     '''\
 # Definitions
 
-Define project variables, etc.''': nbf.v4.new_markdown_cell,
+Define project variables, etc.''': nbformat.v4.new_markdown_cell,
                     '''\
-import resumableds''': nbf.v4.new_code_cell,
+import resumableds''': nbformat.v4.new_code_cell,
                     '''\
 # DS project name
 project = '%s'
 
 # create project
-rds = resumableds.RdsProject(project, 'defs')''' % self.project_name: nbf.v4.new_code_cell,
+rds = resumableds.RdsProject(project, 'defs')''' % self.project_name: nbformat.v4.new_code_cell,
                     '''\
 # your variables / definitions go here...
 
 #rds.defs.a = 'a variable'
-''': nbf.v4.new_code_cell,
+''': nbformat.v4.new_code_cell,
                     '''\
 # save defs to disk
-rds.save('defs')''': nbf.v4.new_code_cell,
+rds.save('defs')''': nbformat.v4.new_code_cell,
             '''\
-*(Notebook is based on resumableds template)*''': nbf.v4.new_markdown_cell,
+*(Notebook is based on resumableds template)*''': nbformat.v4.new_markdown_cell,
                 }
 
 
@@ -761,76 +1149,76 @@ rds.save('defs')''': nbf.v4.new_code_cell,
                     '''\
 # Data collection
 
-Get raw data from data storages.''': nbf.v4.new_markdown_cell,
+Get raw data from data storages.''': nbformat.v4.new_markdown_cell,
                     '''\
-import resumableds''': nbf.v4.new_code_cell,
+import resumableds''': nbformat.v4.new_code_cell,
                     '''\
 # DS project name
 project = '%s'
 
 # create project
-rds = resumableds.RdsProject(project, 'raw')''' % self.project_name: nbf.v4.new_code_cell,
+rds = resumableds.RdsProject(project, 'raw')''' % self.project_name: nbformat.v4.new_code_cell,
                     '''\
 # your data retrieval here
 
 #rds.raw.customer_details = pd.read_sql_table('customer_details', example_con)
-''': nbf.v4.new_code_cell,
+''': nbformat.v4.new_code_cell,
                     '''\
 # save project
-rds.save('raw')''': nbf.v4.new_code_cell,
+rds.save('raw')''': nbformat.v4.new_code_cell,
                     '''\
-*(Notebook is based on resumableds template)*''': nbf.v4.new_markdown_cell,
+*(Notebook is based on resumableds template)*''': nbformat.v4.new_markdown_cell,
                         }
 
         nb_processing = {
                     '''\
 # Processing
 
-Manipulate your data.''': nbf.v4.new_markdown_cell,
+Manipulate your data.''': nbformat.v4.new_markdown_cell,
                     '''\
-import resumableds''': nbf.v4.new_code_cell,
+import resumableds''': nbformat.v4.new_code_cell,
                     '''\
 # DS project name
 project = '%s'
 
 # create project
-rds = resumableds.RdsProject(project, ['raw', 'interim', 'processed'])''' % self.project_name: nbf.v4.new_code_cell,
+rds = resumableds.RdsProject(project, ['raw', 'interim', 'processed'])''' % self.project_name: nbformat.v4.new_code_cell,
                     '''\
 # your data processing here
 
 #rds.interim.german_customers = rds.raw.customer_details.loc[rds.raw.customer_details['country'] == 'Germany']
 #rds.processed.customers_by_city = rds.interim.german_customers.groupby('city').customer_name.count()
-''': nbf.v4.new_code_cell,
+''': nbformat.v4.new_code_cell,
                     '''\
 # save project
-rds.save(['interim', 'processed'])''': nbf.v4.new_code_cell,
+rds.save(['interim', 'processed'])''': nbformat.v4.new_code_cell,
                     '''\
-*(Notebook is based on resumableds template)*''': nbf.v4.new_markdown_cell,
+*(Notebook is based on resumableds template)*''': nbformat.v4.new_markdown_cell,
                         }
 
         nb_graphs = {
                     '''\
 # Graphical output
 
-Visualize your data.''': nbf.v4.new_markdown_cell,
+Visualize your data.''': nbformat.v4.new_markdown_cell,
                     '''\
-import resumableds''': nbf.v4.new_code_cell,
+import resumableds''': nbformat.v4.new_code_cell,
                     '''\
 # DS project name
 project = '%s'
 
 # create project
-rds = resumableds.RdsProject(project, ['processed'])''' % self.project_name: nbf.v4.new_code_cell,
+rds = resumableds.RdsProject(project, ['processed'])''' % self.project_name: nbformat.v4.new_code_cell,
                     '''\
 # your data visualization here
 
 #rds.processed.customers_by_city.plot()
-''': nbf.v4.new_code_cell,
+''': nbformat.v4.new_code_cell,
                     '''\
 # save project
-rds.save('defs')''': nbf.v4.new_code_cell,
+rds.save('defs')''': nbformat.v4.new_code_cell,
                     '''\
-*(Notebook is based on resumableds template)*''': nbf.v4.new_markdown_cell,
+*(Notebook is based on resumableds template)*''': nbformat.v4.new_markdown_cell,
                   }
 
 
@@ -844,6 +1232,6 @@ rds.save('defs')''': nbf.v4.new_code_cell,
 
         for nb_name, nb_cells in nb_templates.items():
             logging.debug('create notebook "%s" from template' % nb_name)
-            nb = nbf.v4.new_notebook()
+            nb = nbformat.v4.new_notebook()
             nb['cells'] = [f(arg) for arg, f in nb_cells.items()]
-            nbf.write(nb, nb_name)
+            nbformat.write(nb, nb_name)
